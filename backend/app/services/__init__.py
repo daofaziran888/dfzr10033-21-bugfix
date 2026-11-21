@@ -16,6 +16,7 @@ from app.services.drill_config import DrillConfigService
 from app.services.result_mart import ResultMartService
 from app.services.benchmark_set import BenchmarkSetService
 from app.services.query_audit import QueryAuditService
+from app.services.audit_report import AuditReportService
 from app.services.cost_govern import CostGovernService
 from app.services.freshness_mon import FreshnessMonService
 from app.services.data_exporter import DataExporterService
@@ -40,6 +41,7 @@ SERVICES: dict[str, BaseModuleService] = {
     "result_mart": ResultMartService(),
     "benchmark_set": BenchmarkSetService(),
     "query_audit": QueryAuditService(),
+    "audit_report": AuditReportService(),
     "cost_govern": CostGovernService(),
     "freshness_mon": FreshnessMonService(),
     "data_exporter": DataExporterService(),

@@ -4,6 +4,7 @@ from __future__ import annotations
 import csv
 import io
 import time
+from datetime import datetime, timedelta
 from typing import Any
 
 from fastapi import APIRouter, HTTPException, Query, Request
@@ -175,7 +176,9 @@ def pipeline_query_audit_profile(
     audits = store.rows("query_audit")
     slow = audit_svc.analyze_slow_queries(threshold_ms=1000)
     profile = audit_svc.get_query_profile(audits[-1]["id"]) if audits else None
-    report = audit_svc.generate_performance_report(time.strftime("%Y-%m-%d"), time.strftime("%Y-%m-%d"))
+    today = datetime.now().replace(hour=0, minute=0, second=0, microsecond=0)
+    report = audit_svc.generate_performance_report(
+        today.strftime("%Y-%m-%d"), (today + timedelta(days=1)).strftime("%Y-%m-%d"))
     return {"ok": True, "pipeline": "query_audit_profile", "slow_analysis": slow,
             "profile": profile, "report": report}
 
@@ -221,3 +224,68 @@ def pipeline_cost_aggregate_alert() -> dict[str, Any]:
             "cost_aggregation": cost_svc.aggregate_module_costs(),
             "quota_check": cost_svc.check_monthly_quota(),
             "cache_report": result_cache_svc.cache_hit_rate_report()}
+
+
+# -- 时段审计报告管道：窗口取数 → 版本登记 → 集市发布 → 领取对账 --
+
+from app.services.audit_report import AuditReportService
+
+audit_report_svc = AuditReportService()
+
+
+@router.post("/pipelines/audit-report/ingest")
+def pipeline_audit_ingest(
+    record_no: str = Query(default=""), query_stmt: str = Query(default="SELECT 1"),
+    elapsed_ms: int = Query(default=100), event_time: str = Query(...),
+    arrival_time: str = Query(default=""), user: str = Query(default="analyst"),
+    source: str = Query(default="query_federation"),
+) -> dict[str, Any]:
+    """接收一笔执行审计：事件时间定窗口，到达时间用于迟到补录，同编号只入账一次。"""
+    result = audit_svc.ingest_execution({
+        "记录编号": record_no, "查询语句": query_stmt, "执行耗时": f"{elapsed_ms}ms",
+        "数据来源": source, "操作用户": user, "查询时间": event_time,
+    }, arrival_time=arrival_time or None)
+    if not result["ok"]:
+        raise HTTPException(status_code=400, detail=result["message"])
+    return {"ok": True, "pipeline": "audit_ingest", **result}
+
+
+@router.post("/pipelines/audit-report/generate")
+def pipeline_audit_report_generate(
+    start_time: str = Query(...), end_time: str = Query(...),
+) -> dict[str, Any]:
+    """生成时段审计汇总：窗口过滤聚合、登记修正版本、发布集市并回写报告清单。"""
+    result = audit_svc.generate_performance_report(start_time, end_time)
+    if not result["ok"]:
+        raise HTTPException(status_code=400, detail=result["message"])
+    return {"ok": True, "pipeline": "audit_window_report", **result}
+
+
+@router.post("/pipelines/audit-report/{report_id}/claim")
+def pipeline_audit_report_claim(report_id: int) -> dict[str, Any]:
+    """从集市领取报告：记录领取时间，重复领取只生效一次。"""
+    result = audit_report_svc.claim_report(report_id)
+    if not result["ok"]:
+        raise HTTPException(status_code=404, detail=result["message"])
+    return {"ok": True, "pipeline": "audit_report_claim", **result}
+
+
+@router.get("/pipelines/audit-report/{report_id}/detail")
+def pipeline_audit_report_detail(report_id: int) -> dict[str, Any]:
+    """报告详情：按执行窗口与版本水位定位入选记录，并带出集市交付明细。"""
+    result = audit_report_svc.report_detail(report_id)
+    if not result["ok"]:
+        raise HTTPException(status_code=404, detail=result["message"])
+    return {"ok": True, "pipeline": "audit_report_detail", **result}
+
+
+@router.get("/pipelines/audit-report/replay")
+def pipeline_audit_report_replay(
+    start_time: str = Query(...), end_time: str = Query(...),
+    version: int = Query(default=0),
+) -> dict[str, Any]:
+    """按窗口重放指定修正版本的结算口径，分子分母均可追到执行编号。"""
+    result = audit_report_svc.replay_window(start_time, end_time, version or None)
+    if not result["ok"]:
+        raise HTTPException(status_code=404, detail=result["message"])
+    return {"ok": True, "pipeline": "audit_report_replay", **result}

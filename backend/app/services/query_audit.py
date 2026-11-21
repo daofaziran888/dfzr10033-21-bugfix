@@ -1,12 +1,20 @@
 """查询审计领域服务：查询日志、慢查询分析、执行性能追踪与跨模块审计串联。"""
 from __future__ import annotations
 
+import threading
 import time
 import uuid
+from datetime import datetime
 from typing import Any
 
+from app.services import audit_window
+from app.services.audit_report import AuditReportService
 from app.services.base import BaseModuleService
+from app.services.result_mart import ResultMartService
 from app.store import store
+
+# 同一窗口的报告生成串行化：并发提交同一窗口只能生效一次。
+_REPORT_LOCK = threading.Lock()
 
 
 class QueryAuditService(BaseModuleService):
@@ -112,39 +120,94 @@ class QueryAuditService(BaseModuleService):
             "cost_records": cost_records,
         }
 
-    def generate_performance_report(self, start_time: str, end_time: str) -> dict[str, Any]:
-        """生成时段性能报告：汇总 query_audit、result_cache、cost_govern，写入 result_mart。"""
-        records = store.rows(self.MODULE)
+    def ingest_execution(self, values: dict[str, Any], *, arrival_time: str | None = None) -> dict[str, Any]:
+        """接收一笔执行审计：事件时间决定所属窗口，到达时间用于迟到版本修正。
 
-        total = len(records)
-        slow = sum(1 for r in records if r.get("status") == "慢查询")
-        terminated = sum(1 for r in records if r.get("status") == "已终止")
+        补录须区分事件时间（查询时间）与到达时间；同一执行编号只入账一次，
+        重复补录直接返回原记录，保证结算总量中每个执行编号只计一次。
+        """
+        event = audit_window.parse_moment(values.get("查询时间"))
+        if event is None:
+            return {"ok": False, "message": "缺少可解析的查询时间（执行事件时间）"}
+        arrival = audit_window.parse_moment(arrival_time) if arrival_time else None
+        arrival_dt = arrival or datetime.now()
+        arrival_label = audit_window.canonical(arrival_dt)
 
-        # 汇总缓存
-        caches = store.rows("result_cache")
-        cache_valid = sum(1 for c in caches if c.get("status") == "有效")
-        cache_total = len(caches)
+        record_no = str(values.get("记录编号") or "").strip()
+        rows = store.rows(self.MODULE)
+        if record_no:
+            for row in rows:
+                if str(row.get("记录编号")) == record_no:
+                    return {"ok": True, "deduplicated": True, "late": False,
+                            "message": f"执行编号{record_no}已入账，重复补录被去重", "record": row}
+        else:
+            record_no = f"QUER-{uuid.uuid4().hex[:8].upper()}"
 
-        # 汇总成本
-        costs = store.rows("cost_govern")
-        cost_active = sum(1 for c in costs if c.get("status") == "已生效")
-        cost_alert = sum(1 for c in costs if c.get("status") == "已告警")
-
-        report = {
-            "period": f"{start_time} ~ {end_time}",
-            "total_queries": total,
-            "slow_queries": slow,
-            "terminated_queries": terminated,
-            "cache_hit_rate": round(cache_valid / max(cache_total, 1), 2),
-            "active_cost_policies": cost_active,
-            "alert_cost_policies": cost_alert,
-            "generated_at": time.strftime("%Y-%m-%d %H:%M:%S"),
+        elapsed_text = str(values.get("执行耗时") or "0ms")
+        try:
+            elapsed = float(elapsed_text.replace("ms", ""))
+        except (ValueError, AttributeError):
+            elapsed = 0.0
+        status = str(values.get("status") or "").strip() or ("慢查询" if elapsed > 5000 else "正常")
+        record = {
+            "id": max((int(row.get("id", 0)) for row in rows), default=0) + 1,
+            "记录编号": record_no,
+            "查询语句": values.get("查询语句", ""),
+            "执行耗时": elapsed_text,
+            "扫描行数": str(values.get("扫描行数", "0")),
+            "返回行数": str(values.get("返回行数", "0")),
+            "数据来源": values.get("数据来源", "query_federation"),
+            "操作用户": values.get("操作用户", "analyst"),
+            "查询时间": audit_window.canonical(event),
+            "到达时间": arrival_label,
+            "status": status,
+            "pending": False,
+            "abnormal": status == "慢查询",
         }
+        rows.append(record)
+        late = arrival_dt > event
+        return {"ok": True, "deduplicated": False, "late": late, "record": record}
 
-        # 写入 result_mart
-        _write_report_to_mart(report)
+    def generate_performance_report(self, start_time: str, end_time: str) -> dict[str, Any]:
+        """生成时段审计汇总：按执行事件时间过滤窗口内审计记录并聚合，登记修正版本后发布集市。
 
-        return {"ok": True, "report": report}
+        窗口为半开区间 [起点, 终点)，相邻时段跨天共用的边界时刻只计入后一期；
+        迟到补录按到达时间推高水位并触发新修正版本；口径相同的重复/并发提交只生效一次。
+        """
+        start = audit_window.parse_moment(start_time)
+        end = audit_window.parse_moment(end_time)
+        if start is None or end is None:
+            return {"ok": False, "message": f"无法解析时段：{start_time} ~ {end_time}"}
+        if not start < end:
+            return {"ok": False, "message": "时段起点必须早于终点（半开区间 [起点, 终点)）"}
+
+        with _REPORT_LOCK:
+            start_label = audit_window.canonical(start)
+            end_label = audit_window.canonical(end)
+            records = audit_window.select_window_records(start, end)
+            summary = audit_window.summarize_records(records)
+            fingerprint = audit_window.window_fingerprint(start, end, summary)
+
+            registry = AuditReportService()
+            latest = registry.latest_for_window(start_label, end_label)
+            if latest is not None and latest.get("口径指纹") == fingerprint:
+                return {"ok": True, "deduplicated": True,
+                        "message": "同一窗口相同口径的报告已生效，重复提交被去重",
+                        "report": latest, "summary": summary}
+
+            report = registry.register_version(
+                start_label=start_label, end_label=end_label,
+                summary=summary, fingerprint=fingerprint)
+            publish = ResultMartService().publish_audit_summary(report)
+
+        return {
+            "ok": True,
+            "deduplicated": False,
+            "report": report,
+            "summary": summary,
+            "mart": publish["mart"],
+            "message": f"窗口{report['统计时段']}第{report['修正版本']}版报告已生成并发布到{publish['mart']['集市编号']}",
+        }
 
 
 def _record_slow_query_cost(slow_count: int, threshold_ms: int) -> None:
@@ -165,23 +228,3 @@ def _record_slow_query_cost(slow_count: int, threshold_ms: int) -> None:
         "abnormal": slow_count > 20,
     }
     rows.append(cost)
-
-
-def _write_report_to_mart(report: dict[str, Any]) -> None:
-    rows = store.rows("result_mart")
-    mart_id = max((int(r.get("id", 0)) for r in rows), default=0) + 1
-    mart = {
-        "id": mart_id,
-        "集市编号": f"RESU-RP{mart_id:04d}",
-        "集市名称": f"性能报告_{report['period']}",
-        "数据来源": "query_audit",
-        "主题域": "性能分析",
-        "行数统计": str(report["total_queries"]),
-        "刷新周期": "daily",
-        "下游消费": "monitoring",
-        "最后刷新": time.strftime("%Y-%m-%d %H:%M:%S"),
-        "status": "可用",
-        "pending": False,
-        "abnormal": False,
-    }
-    rows.append(mart)

@@ -157,6 +157,17 @@ export const MODULES: ModuleMeta[] = [
     metrics: ["记录总数", "慢查询数", "已终止数"],
   },
   {
+    key: "audit_report",
+    name: "性能报告",
+    entity: "时段审计报告",
+    desc: "按执行窗口汇总的时段审计报告：慢查询占比、修正版本、集市发布回写与领取对账。",
+    fields: ["报告编号", "统计时段", "修正版本", "执行总量", "慢查询量", "慢查询占比", "发布集市", "生成时间"],
+    statuses: ["已生成", "已发布", "已领取", "已修正"],
+    actions: ["领取报告"],
+    actionTargets: {"领取报告": "已领取"},
+    metrics: ["报告总数", "已发布报告", "已修正版本"],
+  },
+  {
     key: "cost_govern",
     name: "成本治理",
     entity: "配额策略",
